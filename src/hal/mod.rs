@@ -40,7 +40,7 @@ pub const LGW_MULTI_NB :u8 =       8;       /* number of LoRa 'multi SF' chains 
 pub const LGW_MULTI_SF_EN:u8 =     0xFF;    /* bitmask to enable/disable SF for multi-sf correlators  (12 11 10 9 8 7 6 5) */
 
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum Modulation{
     UNDEFINED   =    0,
@@ -578,7 +578,7 @@ impl Default for LgwConfDebug {
 @struct LgwPktRx
 @brief Structure containing the metadata of a packet that was received and a pointer to the payload
 */
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct LgwPktRx {
     pub freq_hz: u32,        /* central frequency of the IF chain */
     pub freq_offset: i32,
@@ -602,6 +602,7 @@ pub struct LgwPktRx {
     pub ftime_received: bool, /* a fine timestamp has been received */
     pub ftime: u32          /* packet fine timestamp (nanoseconds since last PPS) */
 }
+
 impl std::fmt::Display for LgwPktRx {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
