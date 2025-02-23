@@ -201,6 +201,13 @@ impl Default for LgwRssiTcomp {
     }
 }
 
+
+#[derive(Debug, Serialize, Deserialize, Default, Clone)]
+pub struct LgwConfMultisfAll {
+    pub spreading_factor_enable: Vec<u8>
+}
+
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LgwConfRxrf {
     pub enable: bool,             //* enable or disable that RF chain */
