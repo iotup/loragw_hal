@@ -68,6 +68,14 @@ impl LgwComTrait for SX1302 {
     fn lgw_connect(&mut self) -> Result<()> {
         let mut u= [0u8; 1];
 
+        let mcu = self.mcu.clone();
+        let ctx = self.ctx.clone();
+
+        let mut mcu = mcu.write().unwrap();
+        
+
+        mcu.open(ctx.read().unwrap().board_cfg.com_path.clone())?;
+
         /* check SX1302 version */
         self.lgw_rb(LgwSpiMuxTarget::LGW_SPI_MUX_TARGET_SX1302, LOREGS[SX1302_REG_COMMON_VERSION_VERSION as usize].addr, &mut u, 1)?;
 
@@ -94,6 +102,8 @@ impl LgwComTrait for SX1302 {
             return Err(Error::LGW_USB_ERROR.into());
         }
 
+        mcu.close();
+        
         Ok(())
     }
 
