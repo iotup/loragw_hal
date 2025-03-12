@@ -1,5 +1,10 @@
 #![allow(dead_code, non_camel_case_types)]
 
+
+pub fn sx1261_freq_to_reg(f: u32) -> u32 {
+  ((f as u64) * (1 << 25) / 32000000u64) as u32
+}
+
 pub enum SX1261OpCode {
   SX1261_CALIBRATE_IMAGE          = 0x98,
   SX1261_CLR_IRQ_STATUS           = 0x02,
@@ -30,7 +35,9 @@ pub enum SX1261OpCode {
   SX1261_GET_STATUS               = 0xC0,
   SX1261_SET_REGULATORMODE        = 0x96,
   SX1261_SET_FS                   = 0xC1,
-  SX1261_GET_DEVICE_ERRORS        = 0x17
+  SX1261_GET_DEVICE_ERRORS        = 0x17,
+  SX1261_0XD9                     = 0xD9,
+  SX1261_0X9B                     = 0x9B
 }
 
 pub enum SX1261StandbyModes {

@@ -1,4 +1,5 @@
 #[derive(thiserror::Error, Debug)]
+#[allow(non_camel_case_types)]
 pub enum Error {
     #[error("LGW_HAL_ERROR")]
     LGW_HAL_ERROR,

@@ -2,7 +2,7 @@ use anyhow::{anyhow,Result};
 use tracing::{debug, error, info};
 use super::helper::wait_ms;
 use super::loragw_sx1302::SX1302;
-use super::{loragw_com::LgwSpiMuxTarget, mcu::command::{ECmdSpiTarget, MCU_SPI_REQ_TYPE_READ_WRITE}, Hal, LGW_RF_CHAIN_NB};
+use super::{loragw_com::LgwSpiMuxTarget, mcu::command::{ECmdSpiTarget, MCU_SPI_REQ_TYPE_READ_WRITE}, LGW_RF_CHAIN_NB};
 
 
 const    STDBY_RC :u8               = 0x00;

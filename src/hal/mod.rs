@@ -24,7 +24,7 @@ use loragw_sx1250::LoragwSx1250Trait;
 use loragw_sx1302::{LorgwSx1302Trait, IF_FSK_STD, IF_LORA_MULTI, IF_LORA_STD, IF_UNDEFINED, SX1302, SX1302_AGC_RADIO_GAIN_AUTO};
 use loragw_sx1302_timestamp::lora_packet_time_on_air;
 use serde::{Deserialize, Serialize};
-use sx1261::loragw_sx1261::SX126x;
+use sx1261::{loragw_sx1261::SX126x, LgwSpectralScanStatus};
 use tracing::{debug, error, info, trace, warn};
 use error::Error;
 
@@ -825,6 +825,10 @@ pub trait LgwHal {
     fn lgw_txgain_setconf(&mut self,  rf_chain:u8, conf: &[LgwTxGain]) -> Result<()>;
     fn lgw_stop(&mut self) -> Result<()> ;
     fn lgw_abort_tx(&mut self, rf_chain: u8) -> Result<()>;
+    fn lgw_spectral_scan_start(&mut self,  freq_hz: u32,  nb_scan: u16) -> Result<()> ;
+    fn lgw_spectral_scan_get_status(&mut self) -> Result<LgwSpectralScanStatus>;
+    fn lgw_spectral_scan_get_results( &mut self) -> Result<([i16; 33], [u16;33])> ;
+    fn lgw_spectral_scan_abort(&mut self) -> Result<()>;
 }
 
 impl LgwHal for Hal {
@@ -1246,6 +1250,30 @@ impl LgwHal for Hal {
         }
         
 
+        /* Connect to the external sx1261 for LBT or Spectral Scan */
+        if ctx.sx1261_cfg.enable == true {
+            if let Err(err) = self.sx1261.connect(){
+                error!(Error=%err, "ERROR: failed to connect to the sx1261 radio (LBT/Spectral Scan)\n");
+                return Err(anyhow!("LGW_HAL_ERROR"));
+            }
+
+            if let Err(err) = self.sx1261.load_pram(){
+                error!(Error=%err, "ERROR: failed to patch sx1261 radio for LBT/Spectral Scan\n");
+                return Err(anyhow!("LGW_HAL_ERROR"));
+            }
+
+            if let Err(err) = self.sx1261.calibrate(ctx.rf_chain_cfg[0].freq_hz) {
+           
+                error!(Error=%err, "ERROR: failed to calibrate sx1261 radio\n");
+                return Err(anyhow!("LGW_HAL_ERROR"));
+            }
+
+            if let Err(err)  = self.sx1261.setup() {
+                error!(Error=%err, "ERROR: failed to setup sx1261 radio");
+                return Err(anyhow!("LGW_HAL_ERROR"));
+            }
+        }
+
         /* Set CONFIG_DONE GPIO to 1 (turn on the corresponding LED) */
         if let Err(_) = self.sx1302.sx1302_set_gpio(0x01){
             
@@ -1604,6 +1632,52 @@ impl LgwHal for Hal {
         let mut mcu = self.mcu.write().unwrap();
         let status = mcu.get_mcu_status()?;
         Ok(status.temperature)
+    }
+
+
+    /* ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ */
+
+    fn lgw_spectral_scan_start(&mut self,  freq_hz: u32,  nb_scan: u16) -> Result<()> {
+
+        let ctx = self.ctx.clone();
+        let ctx_sx1261 = ctx.read().unwrap().sx1261_cfg.clone();
+
+        if ctx_sx1261.enable != true {
+            error!("ERROR: sx1261 is not enabled, no spectral scan\n");
+            return Err(Error::LGW_HAL_ERROR.into());
+        }
+
+        if let Err(err) = self.sx1261.set_rx_params(freq_hz, BW_125KHZ){
+            error!("ERROR: Failed to set RX params for Spectral Scan\n");
+            return Err(Error::LGW_HAL_ERROR.into());
+        }
+
+        if let Err(err) = self.sx1261.spectral_scan_start(nb_scan) {
+            error!("ERROR: start spectral scan failed\n");
+            return Err(Error::LGW_HAL_ERROR.into());
+        }
+
+        Ok(())
+    }
+
+    /* ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ */
+
+    fn lgw_spectral_scan_get_status(&mut self) -> Result<LgwSpectralScanStatus> {
+        self.sx1261.spectral_scan_status()
+    }
+
+    /* ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ */
+
+    fn lgw_spectral_scan_get_results( &mut self) -> Result<([i16; 33], [u16;33])> {
+
+        let sx1261_ctx = self.ctx.read().unwrap().sx1261_cfg.clone();
+        return self.sx1261.spectral_scan_get_results(sx1261_ctx.rssi_offset as i8)
+    }
+
+    /* ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ */
+
+    fn lgw_spectral_scan_abort(&mut self) -> Result<()> {
+        self.sx1261.spectral_scan_abort()
     }
 }
 
