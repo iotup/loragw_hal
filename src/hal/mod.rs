@@ -492,7 +492,7 @@ impl Default for LgwConfigFtime {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 #[allow(non_camel_case_types)]
 pub enum LgwLbtScanTime {
     LGW_LBT_SCAN_TIME_128_US    = 128,
@@ -829,10 +829,40 @@ pub trait LgwHal {
     fn lgw_spectral_scan_get_status(&mut self) -> Result<LgwSpectralScanStatus>;
     fn lgw_spectral_scan_get_results( &mut self) -> Result<([i16; 33], [u16;33])> ;
     fn lgw_spectral_scan_abort(&mut self) -> Result<()>;
+    fn lgw_sx1261_setconf(&mut self, conf:&LgwConfSx1261) ->Result<()>;
 }
 
 impl LgwHal for Hal {
-    
+    fn lgw_sx1261_setconf(&mut self, conf: &LgwConfSx1261) -> Result<()> {
+
+        let mut ctx = self.ctx.write().unwrap();
+        let CONTEXT_SX1261 = &mut ctx.sx1261_cfg;
+        
+        /* Set the SX1261 global conf */
+        CONTEXT_SX1261.enable = conf.enable;
+        CONTEXT_SX1261.rssi_offset = conf.rssi_offset;
+
+        /* Set the LBT conf */
+        CONTEXT_SX1261.lbt_conf.enable = conf.lbt_conf.enable;
+        CONTEXT_SX1261.lbt_conf.rssi_target = conf.lbt_conf.rssi_target;
+        CONTEXT_SX1261.lbt_conf.nb_channel = conf.lbt_conf.nb_channel;
+
+        for i in 0 .. CONTEXT_SX1261.lbt_conf.nb_channel as usize {
+            if conf.lbt_conf.channels[i].bandwidth != BW_125KHZ && conf.lbt_conf.channels[i].bandwidth != BW_250KHZ {
+                error!("ERROR: bandwidth not supported for LBT channel {}\n", i);
+                return Err(Error::LGW_HAL_ERROR.into());
+            }
+
+            if conf.lbt_conf.channels[i].scan_time_us != LgwLbtScanTime::LGW_LBT_SCAN_TIME_128_US && conf.lbt_conf.channels[i].scan_time_us != LgwLbtScanTime::LGW_LBT_SCAN_TIME_5000_US {
+                error!("ERROR: scan_time_us not supported for LBT channel {}\n", i);
+                return Err(Error::LGW_HAL_ERROR.into());
+            }
+
+            CONTEXT_SX1261.lbt_conf.channels[i] = conf.lbt_conf.channels[i];
+        }
+
+        Ok(())
+    }
 
     fn lgw_abort_tx(&mut self, rf_chain: u8) -> Result<()> {
        
