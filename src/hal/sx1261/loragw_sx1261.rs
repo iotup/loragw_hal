@@ -63,8 +63,8 @@ impl SX126x {
         in_out_buf[1] = MCU_SPI_REQ_TYPE_READ_WRITE;
         in_out_buf[2] = ECmdSpiTarget::MCU_SPI_TARGET_SX1261 as u8;
 
-        in_out_buf[3] = (size as u8 + 1) >> 8; /* payload size + op_code */
-        in_out_buf[4] = (size as u8 + 1) >> 0; /* payload size + op_code */
+        in_out_buf[3] = ((size  + 1) >> 8) as u8; /* payload size + op_code */
+        in_out_buf[4] = ((size  + 1) >> 0) as u8; /* payload size + op_code */
 
         in_out_buf[5] = op_code as u8;
 
