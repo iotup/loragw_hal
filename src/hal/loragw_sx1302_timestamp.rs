@@ -1,3 +1,4 @@
+use super::loragw_sx1302::SX1302;
 use super::{LoragwRegTrait, BW_125KHZ, BW_250KHZ, BW_500KHZ, SX1302_REG_RX_TOP_RX_BUFFER_LEGACY_TIMESTAMP, SX1302_REG_RX_TOP_RXBUFFER_TIMESTAMP_CFG_MAX_TS_METRICS, SX1302_REG_RX_TOP_TIMESTAMP_ENABLE, SX1302_REG_RX_TOP_TIMESTAMP_NB_SYMB};
 
 use super::{LgwContext, loragw_sx1302::{RX_DFT_PEAK_MODE_DISABLED, SET_PPM_ON}, Hal};
@@ -138,11 +139,7 @@ pub trait SX1302TimestampTrait {
 }
 
 
-impl SX1302TimestampTrait for Hal {
-
-
-    
-
+impl SX1302TimestampTrait for SX1302 {
     
     fn timestamp_counter_mode(&mut self,  ftime_enable:bool)->Result<()>{
         

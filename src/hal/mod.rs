@@ -12,16 +12,19 @@ mod loragw_sx1302;
 mod agc_firmware;
 mod loragw_usb_com;
 pub mod loragw_com;
+mod sx1261;
+
+use std::sync::{Arc, RwLock};
 
 use agc_firmware::{AGC_FIRMWARE_SX1250, AGC_FIRMWARE_SX125X};
 use anyhow::{anyhow,Result};
-use loragw_com::LgwComType;
+use loragw_com::{LgwComTrait, LgwComType};
 use loragw_reg::*;
 use loragw_sx1250::LoragwSx1250Trait;
-use loragw_sx1302::{LorgwSx1302Trait, Sx1302, IF_FSK_STD, IF_LORA_MULTI, IF_LORA_STD, IF_UNDEFINED, SX1302_AGC_RADIO_GAIN_AUTO};
+use loragw_sx1302::{LorgwSx1302Trait, IF_FSK_STD, IF_LORA_MULTI, IF_LORA_STD, IF_UNDEFINED, SX1302, SX1302_AGC_RADIO_GAIN_AUTO};
 use loragw_sx1302_timestamp::lora_packet_time_on_air;
-use mcu::McuTrait;
 use serde::{Deserialize, Serialize};
+use sx1261::loragw_sx1261::SX126x;
 use tracing::{debug, error, info, trace, warn};
 use error::Error;
 
@@ -729,27 +732,25 @@ impl Default for LgwPktTx {
 #[derive(Debug, Clone)]
 pub struct LgwContext {
     /* Global context */
-    pub is_started: bool,          //* is the LoRa concentrator started ? */;
-    pub board_cfg: LgwConfigBoard,  //* Basic system configuration */;
+    pub         board_cfg: LgwConfigBoard,  //* Basic system configuration */;
     /* RX context */
-    pub       rf_chain_cfg:[LgwConfRxrf;LGW_RF_CHAIN_NB as usize],
-    pub       if_chain_cfg:[LgwConfRxIf;LGW_IF_CHAIN_NB as usize],
-    pub       demod_cfg:LgwConfDemod,  //* demodulation configuration */;
-    pub       lora_service_cfg:LgwConfRxIf,                       /* LoRa service channel config parameters */
-    pub       fsk_cfg:LgwConfRxIf,                                /* FSK channel config parameters */
+    pub         rf_chain_cfg:[LgwConfRxrf;LGW_RF_CHAIN_NB as usize],
+    pub         if_chain_cfg:[LgwConfRxIf;LGW_IF_CHAIN_NB as usize],
+    pub         demod_cfg:LgwConfDemod,  //* demodulation configuration */;
+    pub         lora_service_cfg:LgwConfRxIf,                       /* LoRa service channel config parameters */
+    pub         fsk_cfg:LgwConfRxIf,                                /* FSK channel config parameters */
     /* TX context */
-    pub       tx_gain_lut:[LgwTxGainLut;LGW_RF_CHAIN_NB as usize],          /* TX gain tables */
+    pub         tx_gain_lut:[LgwTxGainLut;LGW_RF_CHAIN_NB as usize],          /* TX gain tables */
     /* Misc */
-    pub      ftime_cfg:LgwConfigFtime,                              /* Fine timestamp configuration */
-    pub      sx1261_cfg:LgwConfSx1261,                             /* SX1261 configuration */
+    pub         ftime_cfg:LgwConfigFtime,                              /* Fine timestamp configuration */
+    pub         sx1261_cfg:LgwConfSx1261,                             /* SX1261 configuration */
     /* Debug */
-    pub      debug_cfg:LgwConfDebug,                              /* Debug configuration */
+    pub         debug_cfg:LgwConfDebug,                              /* Debug configuration */
 }
 
 impl Default for LgwContext {
     fn default() -> Self {
         Self { 
-            is_started: false, 
             board_cfg: Default::default(), 
             rf_chain_cfg: [
                 LgwConfRxrf {
@@ -788,18 +789,24 @@ impl Default for LgwContext {
 
 #[derive(Debug)]
 pub struct Hal {
-    pub mcu: mcu::Mcu,
-    pub ctx:LgwContext,
-    pub sx1302: Sx1302,
+    pub is_started: bool,          //* is the LoRa concentrator started ? */;
+    pub mcu: Arc<RwLock<mcu::Mcu>>,
+    pub ctx:Arc<RwLock<LgwContext>>,
+    pub sx1302: SX1302,
+    pub sx1261: SX126x,
 }
 
 impl Hal {
 
     pub fn new() -> Self {
+        let mcu = Arc::new(RwLock::new(mcu::Mcu::new()));
+        let ctx = Arc::new(RwLock::new(LgwContext::default()));
         Self {
-            mcu: mcu::Mcu::new(),
-            ctx: Default::default(),
-            sx1302: Sx1302::new(),
+            is_started: false,
+            mcu: mcu.clone(),
+            ctx: ctx.clone(),
+            sx1302: SX1302::new(mcu.clone(), ctx.clone()),
+            sx1261: SX126x::new(mcu.clone())
         }
     }
 
@@ -812,7 +819,7 @@ pub trait LgwHal {
     fn lgw_rxrf_setconf(&mut self,  rf_chain:u8,   conf:&LgwConfRxrf) -> Result<()>;
     fn lgw_rxif_setconf(&mut self,  if_chain:u8, conf:&LgwConfRxIf) ->Result<()>;
     fn lgw_demod_setconf(&mut self, conf: &LgwConfDemod);
-    fn lgw_get_temperature(&mut self) -> Result<f32>;
+    fn lgw_get_temperature(&self) -> Result<f32>;
     fn lgw_send(&mut self, pkt_data:&LgwPktTx) -> Result<()>;
     fn lgw_get_instcnt(&mut self) -> Result<u32>;
     fn lgw_txgain_setconf(&mut self,  rf_chain:u8, conf: &[LgwTxGain]) -> Result<()>;
@@ -833,13 +840,13 @@ impl LgwHal for Hal {
         }
 
         /* Abort current TX */
-        self.sx1302_tx_abort(rf_chain)
+        self.sx1302.sx1302_tx_abort(rf_chain)
 
     }
 
     fn lgw_stop(&mut self) -> Result<()> {
        
-        if self.ctx.is_started == false {
+        if self.is_started == false {
             info!("Note: LoRa concentrator was not started...");
             return Ok(());
         }
@@ -853,12 +860,12 @@ impl LgwHal for Hal {
         }
 
         info!("INFO: Disconnecting");
-        if let Err(e) = self.mcu.lgw_disconnect() {
+        if let Err(e) = self.sx1302.lgw_disconnect() {
             error!(e=?e, "ERROR: failed to disconnect concentrator");
             return Err(e)
         }
 
-        self.ctx.is_started = false;
+        self.is_started = false;
 
 
         return Ok(());
@@ -867,12 +874,12 @@ impl LgwHal for Hal {
 
         //let lbt_tx_allowed:bool;
         /* performances variables */
-        let ctx = self.ctx.clone();
+        let ctx = self.ctx.read().unwrap();
 
         debug!(" --- {:}\n", "IN");
 
         /* check if the concentrator is running */
-        if self.ctx.is_started == false {
+        if self.is_started == false {
             error!("ERROR: CONCENTRATOR IS NOT RUNNING, START IT BEFORE SENDING\n");
             return Err(Error::LGW_HAL_ERROR.into());
         }
@@ -946,7 +953,7 @@ impl LgwHal for Hal {
         */
         /* Send the TX request to the concentrator */
         let mut tx = pkt_data.clone();
-        if let Err(err) =  self.sx1302_send(ctx.rf_chain_cfg[pkt_data.rf_chain as usize]._type, &ctx.tx_gain_lut[pkt_data.rf_chain as usize], ctx.board_cfg.lorawan_public, &ctx.fsk_cfg, &mut tx) {
+        if let Err(err) =  self.sx1302.sx1302_send(ctx.rf_chain_cfg[pkt_data.rf_chain as usize]._type, &ctx.tx_gain_lut[pkt_data.rf_chain as usize], ctx.board_cfg.lorawan_public, &ctx.fsk_cfg, &mut tx) {
    
             error!(e=%err, "ERROR: Failed to send packet\n");
             /* 
@@ -997,13 +1004,15 @@ impl LgwHal for Hal {
     }
 
     fn lgw_get_instcnt(&mut self) -> Result<u32> {
-        self.sx1302_timestamp_counter(false)
+        self.sx1302.sx1302_timestamp_counter(false)
     }
 
     fn lgw_receive(&mut self) -> Result<Vec<LgwPktRx>> {
 
         let mut pkts = Vec::<LgwPktRx>::new();
-        let nb_pkg_fetched = self.sx1302_fetch();
+        let ctx = self.ctx.read().unwrap();
+
+        let nb_pkg_fetched = self.sx1302.sx1302_fetch();
         if nb_pkg_fetched.is_err() {
             error!("ERROR: failed to fetch packets from SX1302\n");
             return Err(anyhow!("LGW_HAL_ERROR"));
@@ -1012,14 +1021,14 @@ impl LgwHal for Hal {
 
         /* Update internal counter */
         /* WARNING: this needs to be called regularly by the upper layer */
-        self.sx1302_update()?;
+        self.sx1302.sx1302_update()?;
 
         let _temp = self.lgw_get_temperature()?;
 
         for _i in 0 .. nb_pkg_fetched {
-            if let  Ok(mut pkt) = self.sx1302_parse(){
-                pkt.rssic += self.ctx.rf_chain_cfg[pkt.rf_chain as usize].rssi_offset;
-                pkt.rssis += self.ctx.rf_chain_cfg[pkt.rf_chain as usize].rssi_offset;
+            if let  Ok(mut pkt) = self.sx1302.sx1302_parse(){
+                pkt.rssic += ctx.rf_chain_cfg[pkt.rf_chain as usize].rssi_offset;
+                pkt.rssis += ctx.rf_chain_cfg[pkt.rf_chain as usize].rssi_offset;
                 debug!(pkt=%pkt);
                 pkts.push(pkt);
             }
@@ -1029,33 +1038,33 @@ impl LgwHal for Hal {
 
     fn lgw_start(&mut self) -> Result<()> {
 
-        let ctx = self.ctx.clone() ;
+        let ctx = self.ctx.read().unwrap() ;
 
-        if ctx.is_started {
+        if self.is_started {
             return Ok(())
         }
 
-        self.lgw_connect()?;
+        self.sx1302.lgw_connect()?;
 
-        self.sx1302_set_gpio(0)?;
+        self.sx1302.sx1302_set_gpio(0)?;
 
-        self.sx1302_radio_calibrate(&ctx.rf_chain_cfg, ctx.board_cfg.clksrc, &ctx.tx_gain_lut)?;
+        self.sx1302.sx1302_radio_calibrate(&ctx.rf_chain_cfg, ctx.board_cfg.clksrc, &ctx.tx_gain_lut)?;
 
 
         /* Setup radios for RX */
         for i in 0 .. LGW_RF_CHAIN_NB {
-            if self.ctx.rf_chain_cfg[i as usize].enable == true {
+            if ctx.rf_chain_cfg[i as usize].enable == true {
                 /* Reset the radio */
-                if let Err(e) = self.sx1302_radio_reset(i, self.ctx.rf_chain_cfg[i as usize]._type) {
+                if let Err(e) = self.sx1302.sx1302_radio_reset(i, ctx.rf_chain_cfg[i as usize]._type) {
                     error!("ERROR: failed to reset radio {}\n", i);
                     return Err(anyhow!("LGW_HAL_ERROR: {}", e));
                 }
 
                 
                 /* Setup the radio */
-                match self.ctx.rf_chain_cfg[i as usize]._type {
+                match ctx.rf_chain_cfg[i as usize]._type {
                     LgwRadioType:: LGW_RADIO_TYPE_SX1250 => {
-                        if let Err(_) = self.sx1250_setup(i, self.ctx.rf_chain_cfg[i as usize].freq_hz, self.ctx.rf_chain_cfg[i as usize].single_input_mode){
+                        if let Err(_) = self.sx1302.sx1250_setup(i, ctx.rf_chain_cfg[i as usize].freq_hz, ctx.rf_chain_cfg[i as usize].single_input_mode){
                             error!("ERROR: failed to setup SX1250: {}", i);
                             return Err(anyhow!("LGW_HAL_ERR"));
                         }
@@ -1075,7 +1084,7 @@ impl LgwHal for Hal {
                 
 
                 /* Set radio mode */
-                if let Err(_) = self.sx1302_radio_set_mode(i, self.ctx.rf_chain_cfg[i as usize]._type){
+                if let Err(_) = self.sx1302.sx1302_radio_set_mode(i, ctx.rf_chain_cfg[i as usize]._type){
              
                     error!("ERROR: failed to set mode for radio {:}\n", i);
                     return Err(anyhow!("LGW_HAL_ERROR"))
@@ -1084,24 +1093,24 @@ impl LgwHal for Hal {
         }
 
         /* Select the radio which provides the clock to the sx1302 */
-        self.sx1302_radio_clock_select(self.ctx.board_cfg.clksrc).map_err(|e| anyhow!("LGW_HAL_ERR: failed to get clock from radio {}",e))?;
+        self.sx1302.sx1302_radio_clock_select(ctx.board_cfg.clksrc).map_err(|e| anyhow!("LGW_HAL_ERR: failed to get clock from radio {}",e))?;
         
 
         /* Release host control on radio (will be controlled by AGC) */
-        self.sx1302_radio_host_ctrl(false).map_err(|e| anyhow!("ERROR: failed to release control over radios {}",e))?;
+        self.sx1302.sx1302_radio_host_ctrl(false).map_err(|e| anyhow!("ERROR: failed to release control over radios {}",e))?;
     
 
         /* Basic initialization of the sx1302 */
-        let ftime_cfg = self.ctx.ftime_cfg.clone();
+        let ftime_cfg = ctx.ftime_cfg.clone();
 
-        if let Err(err) = self.sx1302_init(&ftime_cfg){
+        if let Err(err) = self.sx1302.sx1302_init(&ftime_cfg){
             error!("ERROR: failed to initialize SX1302: {}", err);
             return Err(anyhow!("LGW_HAL_ERROR"));
         }
         
         /* Configure PA/LNA LUTs */
-        let board_cfg = self.ctx.board_cfg.clone();
-        if let Err(err) = self.sx1302_pa_lna_lut_configure(&board_cfg){
+        let board_cfg = ctx.board_cfg.clone();
+        if let Err(err) = self.sx1302.sx1302_pa_lna_lut_configure(&board_cfg){
  
             error!("ERROR: failed to configure SX1302 PA/LNA LUT: {}", err);
             return Err(anyhow!("LGW_HAL_ERROR"));
@@ -1109,29 +1118,29 @@ impl LgwHal for Hal {
 
 
         /* Configure Radio FE */
-        if let Err(_) = self.sx1302_radio_fe_configure() {
+        if let Err(_) = self.sx1302.sx1302_radio_fe_configure() {
             error!("ERROR: failed to configure SX1302 radio frontend\n");
             return Err(anyhow!("LGW_HAL_ERROR"));
         }
 
         /* Configure the Channelizer */
-        let if_chain_cfg = self.ctx.if_chain_cfg;
-        if let Err(_) = self.sx1302_channelizer_configure(&if_chain_cfg, false){
+        let if_chain_cfg = ctx.if_chain_cfg;
+        if let Err(_) = self.sx1302.sx1302_channelizer_configure(&if_chain_cfg, false){
             error!("ERROR: failed to configure SX1302 channelizer\n");
             return Err(anyhow!("LGW_HAL_ERROR"));
         }
         
-        let demod_cfg = self.ctx.demod_cfg;
+        let demod_cfg = ctx.demod_cfg;
         /* configure LoRa 'multi-sf' modems */
-        if let Err(_) = self.sx1302_lora_correlator_configure(&if_chain_cfg, &demod_cfg)
+        if let Err(_) = self.sx1302.sx1302_lora_correlator_configure(&if_chain_cfg, &demod_cfg)
         {
             error!("ERROR: failed to configure SX1302 LoRa modem correlators\n");
             return Err(anyhow!("LGW_HAL_ERR"))
         }
 
-        let rf_chain_cfg = &self.ctx.rf_chain_cfg;
+        let rf_chain_cfg = ctx.rf_chain_cfg.clone();
 
-        if let Err(_) = self.sx1302_lora_modem_configure(rf_chain_cfg[0].freq_hz)
+        if let Err(_) = self.sx1302.sx1302_lora_modem_configure(rf_chain_cfg[0].freq_hz)
         {
             error!("ERROR: failed to configure SX1302 LoRa modems\n");
             return Err(anyhow!("LGW_HAL_ERR"))
@@ -1139,13 +1148,13 @@ impl LgwHal for Hal {
 
         /* configure LoRa 'single-sf' modem */
         if if_chain_cfg[8].enable == true {
-            let lora_service_cfg = self.ctx.lora_service_cfg;
-            if let Err(e) = self.sx1302_lora_service_correlator_configure(&lora_service_cfg) {
+            let lora_service_cfg = ctx.lora_service_cfg;
+            if let Err(e) = self.sx1302.sx1302_lora_service_correlator_configure(&lora_service_cfg) {
                 error!(e=%e, "ERROR: failed to configure SX1302 LoRa Service modem correlators\n");
                 return Err(anyhow!("LGW_HAL_ERR"));
             }
 
-            if let Err(e) =self.sx1302_lora_service_modem_configure(&lora_service_cfg, self.ctx.rf_chain_cfg[0].freq_hz){
+            if let Err(e) =self.sx1302.sx1302_lora_service_modem_configure(&lora_service_cfg, ctx.rf_chain_cfg[0].freq_hz){
                 error!(e=%e,"ERROR: failed to configure SX1302 LoRa Service modem\n");
                 return Err(anyhow!("LGW_HAL_ERR"));
             }
@@ -1153,22 +1162,22 @@ impl LgwHal for Hal {
 
         /* configure FSK modem */
         if if_chain_cfg[9].enable == true {
-            let fsk_cfg = self.ctx.fsk_cfg;
+            let fsk_cfg = ctx.fsk_cfg;
 
-            if let Err(_) =self.sx1302_fsk_configure(&fsk_cfg){
+            if let Err(_) =self.sx1302.sx1302_fsk_configure(&fsk_cfg){
                 error!("ERROR: failed to configure SX1302 FSK modem\n");
                 return Err(anyhow!("LGW_HAL_ERR"));
             }
         }
 
         /* configure syncword */
-        if let Err(_) =self.sx1302_lora_syncword(self.ctx.board_cfg.lorawan_public, self.ctx.lora_service_cfg.datarate as u8){
+        if let Err(_) =self.sx1302.sx1302_lora_syncword(ctx.board_cfg.lorawan_public, ctx.lora_service_cfg.datarate as u8){
             error!("ERROR: failed to configure SX1302 LoRa syncword\n");
             return Err(anyhow!("LGW_HAL_ERR"));
         }
 
         /* enable demodulators - to be done before starting AGC/ARB */
-        if let Err(_) =self.sx1302_modem_enable(){
+        if let Err(_) =self.sx1302.sx1302_modem_enable(){
             error!("ERROR: failed to enable SX1302 modems\n");
             return Err(anyhow!("LGW_HAL_ERR"));
         }
@@ -1176,10 +1185,10 @@ impl LgwHal for Hal {
         let fw_version_agc:u8;
 
          /* Load AGC firmware */
-         match self.ctx.rf_chain_cfg[self.ctx.board_cfg.clksrc as usize]._type {
+         match ctx.rf_chain_cfg[ctx.board_cfg.clksrc as usize]._type {
             LgwRadioType::LGW_RADIO_TYPE_SX1250 => {
                 debug!("Loading AGC fw for sx1250\n");
-                if let Err(e) = self.sx1302_agc_load_firmware(&AGC_FIRMWARE_SX1250){
+                if let Err(e) = self.sx1302.sx1302_agc_load_firmware(&AGC_FIRMWARE_SX1250){
                     error!("ERROR: failed to load AGC firmware for sx1250: {}\n", e);
                     return Err(anyhow!("LGW_HAL_ERROR"));
                 }
@@ -1189,7 +1198,7 @@ impl LgwHal for Hal {
             LgwRadioType:: LGW_RADIO_TYPE_SX1257  => 
             {
                 debug!("Loading AGC fw for sx125x\n");
-                if let Err(err) = self.sx1302_agc_load_firmware(&AGC_FIRMWARE_SX125X){
+                if let Err(err) = self.sx1302.sx1302_agc_load_firmware(&AGC_FIRMWARE_SX125X){
                     error!("ERROR: failed to load AGC firmware for sx125x {}\n", err);
                     return Err(anyhow!("LGW_HAL_ERROR"));
                 }
@@ -1198,39 +1207,39 @@ impl LgwHal for Hal {
             }
                 
             _ =>{
-                error!("ERROR: failed to load AGC firmware, radio type not supported ({:})\n", self.ctx.rf_chain_cfg[self.ctx.board_cfg.clksrc as usize]._type);
+                error!("ERROR: failed to load AGC firmware, radio type not supported ({:})\n", ctx.rf_chain_cfg[ctx.board_cfg.clksrc as usize]._type);
                 return Err(anyhow!("LGW_HAL_ERROR"));
             }
         }
 
-        if let Err(err) = self.sx1302_agc_start(fw_version_agc, self.ctx.rf_chain_cfg[self.ctx.board_cfg.clksrc as usize]._type, SX1302_AGC_RADIO_GAIN_AUTO, SX1302_AGC_RADIO_GAIN_AUTO, self.ctx.board_cfg.full_duplex, self.ctx.sx1261_cfg.lbt_conf.enable){
+        if let Err(err) = self.sx1302.sx1302_agc_start(fw_version_agc, ctx.rf_chain_cfg[ctx.board_cfg.clksrc as usize]._type, SX1302_AGC_RADIO_GAIN_AUTO, SX1302_AGC_RADIO_GAIN_AUTO, ctx.board_cfg.full_duplex, ctx.sx1261_cfg.lbt_conf.enable){
             error!("ERROR: failed to start AGC firmware: {}", err);
             return Err(anyhow!("LGW_HAL_ERROR"));
         }
 
         /* Load ARB firmware */
         info!("Loading ARB fw\n");
-        if let Err(err) = self.sx1302_arb_load_firmware(&arb_firmware::ARB_FIRMWARE)
+        if let Err(err) = self.sx1302.sx1302_arb_load_firmware(&arb_firmware::ARB_FIRMWARE)
         {
             error!("ERROR: failed to load ARB firmware: {}", err);
             return Err(anyhow!("LGW_HAL_ERROR"));
         }
         
-        let ftime_cfg = self.ctx.ftime_cfg;
-        if let Err(_) = self.sx1302_arb_start(FW_VERSION_ARB, &ftime_cfg){
+        let ftime_cfg = ctx.ftime_cfg;
+        if let Err(_) = self.sx1302.sx1302_arb_start(FW_VERSION_ARB, &ftime_cfg){
             error!("ERROR: failed to start ARB firmware\n");
             return Err(anyhow!("LGW_HAL_ERROR"));
         }
 
         
-        if let Err(_) = self.sx1302_tx_configure(self.ctx.rf_chain_cfg[self.ctx.board_cfg.clksrc as usize]._type){
+        if let Err(_) = self.sx1302.sx1302_tx_configure(ctx.rf_chain_cfg[ctx.board_cfg.clksrc as usize]._type){
 
             error!("ERROR: failed to configure SX1302 TX path\n");
             return Err(anyhow!("LGW_HAL_ERROR"));
         }
 
 
-        if let Err(err) = self.sx1302_gps_enable(true){
+        if let Err(err) = self.sx1302.sx1302_gps_enable(true){
 
             error!("ERROR: failed to enable GPS on sx1302: {}", err);
             return Err(anyhow!("LGW_HAL_ERROR"));
@@ -1238,13 +1247,13 @@ impl LgwHal for Hal {
         
 
         /* Set CONFIG_DONE GPIO to 1 (turn on the corresponding LED) */
-        if let Err(_) = self.sx1302_set_gpio(0x01){
+        if let Err(_) = self.sx1302.sx1302_set_gpio(0x01){
             
             error!("ERROR: failed to set CONFIG_DONE GPIO\n");
             return Err(anyhow!("LGW_HAL_ERROR"));   
         }
 
-        self.ctx.is_started = true;
+        self.is_started = true;
 
 
         info!("lgw_start done");
@@ -1255,7 +1264,7 @@ impl LgwHal for Hal {
 
     fn lgw_board_setconf(&mut self, conf:&LgwConfigBoard) -> Result<()> {
 
-        if self.ctx.is_started {
+        if self.is_started {
             error!("ERROR: CONCENTRATOR IS RUNNING, STOP IT BEFORE TOUCHING CONFIGURATION");
             return Err(anyhow!("CONCENTRATOR IS RUNNING"));
         }
@@ -1266,12 +1275,13 @@ impl LgwHal for Hal {
             return Err(anyhow!("ERROR: WRONG COM TYPE"))
         }
 
+        let mut ctx = self.ctx.write().unwrap();
         /* set internal config according to parameters */
-        self.ctx.board_cfg.lorawan_public = conf.lorawan_public;
-        self.ctx.board_cfg.clksrc = conf.clksrc;
-        self.ctx.board_cfg.full_duplex = conf.full_duplex;
-        self.ctx.board_cfg.com_type = conf.com_type;
-        self.ctx.board_cfg.com_path = conf.com_path.to_owned();
+        ctx.board_cfg.lorawan_public = conf.lorawan_public;
+        ctx.board_cfg.clksrc = conf.clksrc;
+        ctx.board_cfg.full_duplex = conf.full_duplex;
+        ctx.board_cfg.com_type = conf.com_type;
+        ctx.board_cfg.com_path = conf.com_path.to_owned();
         
 
        Ok(())
@@ -1279,7 +1289,7 @@ impl LgwHal for Hal {
 
     fn lgw_rxrf_setconf(&mut self,  rf_chain:u8,   conf:&LgwConfRxrf) -> Result<()>{
 
-        if self.ctx.is_started {
+        if self.is_started {
             error!("ERROR: CONCENTRATOR IS RUNNING, STOP IT BEFORE TOUCHING CONFIGURATION");
             return Err(anyhow!("CONCENTRATOR IS RUNNING"));
         }
@@ -1308,7 +1318,9 @@ impl LgwHal for Hal {
             return Err(anyhow!("NOT A VALID RADIO CENTER FREQUENCY"));
         }
 
-        let ctx_rf_chain = &mut self.ctx.rf_chain_cfg[rf_chain as usize];
+        let mut ctx = self.ctx.write().unwrap();
+
+        let ctx_rf_chain = &mut ctx.rf_chain_cfg[rf_chain as usize];
 
         /* set internal config according to parameters */
         ctx_rf_chain.enable = conf.enable;
@@ -1336,7 +1348,9 @@ impl LgwHal for Hal {
 
     fn lgw_txgain_setconf(&mut self,  rf_chain:u8, conf: &[LgwTxGain]) -> Result<()> {
 
-        let ctx = &mut self.ctx.tx_gain_lut;
+        let ctx = &mut self.ctx.write().unwrap().tx_gain_lut;
+
+
         /* Check LUT size */
         if (conf.len() < 1) || (conf.len() > TX_GAIN_LUT_SIZE_MAX) {
             error!("ERROR: TX gain LUT must have at least one entry and  maximum {} entries\n", TX_GAIN_LUT_SIZE_MAX);
@@ -1391,7 +1405,7 @@ impl LgwHal for Hal {
 
 
         /* check if the concentrator is running */
-        if self.ctx.is_started {
+        if self.is_started {
             error!("ERROR: CONCENTRATOR IS RUNNING, STOP IT BEFORE TOUCHING CONFIGURATION");
             return Err(anyhow!("CONCENTRATOR IS RUNNING"));
         }
@@ -1402,7 +1416,8 @@ impl LgwHal for Hal {
             return Err(anyhow!("Invalid IF_CHAIN"));
         }
 
-        let ctx_if_chain = &mut self.ctx.if_chain_cfg[if_chain as usize];
+
+        let ctx_if_chain = &mut self.ctx.write().unwrap().if_chain_cfg[if_chain as usize];
 
         /* if chain is disabled, don't care about most parameters */
         if conf.enable == false {
@@ -1413,7 +1428,7 @@ impl LgwHal for Hal {
         }
 
         /* check 'general' parameters */
-        if <Hal as LorgwSx1302Trait>::sx1302_get_ifmod_config(if_chain) == IF_UNDEFINED as u8 {
+        if <SX1302 as LorgwSx1302Trait>::sx1302_get_ifmod_config(if_chain) == IF_UNDEFINED as u8 {
             error!("ERROR: IF CHAIN {:} NOT CONFIGURABLE\n", if_chain);
             return Err(anyhow!("IF CHAIN NOT CONFIGURABLE"))
         }
@@ -1449,7 +1464,7 @@ impl LgwHal for Hal {
 
         /* check parameters according to the type of IF chain + modem,
         fill default if necessary, and commit configuration if everything is OK */
-        match <Hal as LorgwSx1302Trait>::sx1302_get_ifmod_config(if_chain) {
+        match <SX1302 as LorgwSx1302Trait>::sx1302_get_ifmod_config(if_chain) {
             IF_LORA_STD => {
                 let mut bandwidth = conf.bandwidth;
                 let mut datarate = conf.datarate;
@@ -1477,7 +1492,7 @@ impl LgwHal for Hal {
                 ctx_if_chain.enable = conf.enable;
                 ctx_if_chain.rf_chain = conf.rf_chain;
                 ctx_if_chain.freq_hz = conf.freq_hz;
-                let mut ctx_lora_service = self.ctx.lora_service_cfg;
+                let mut ctx_lora_service = self.ctx.write().unwrap().lora_service_cfg;
 
                 ctx_lora_service.bandwidth = bandwidth;
                 ctx_lora_service.datarate = datarate;
@@ -1545,7 +1560,7 @@ impl LgwHal for Hal {
                     error!("ERROR: DATARATE NOT SUPPORTED BY FSK IF CHAIN\n");
                     return Err(anyhow!("DATARATE NOT SUPPORTED BY FSK IF CHAIN"));
                 }
-                let mut ctx_fsk = self.ctx.fsk_cfg;
+                let mut ctx_fsk = self.ctx.write().unwrap().fsk_cfg;
                 /* set internal configuration  */
                 ctx_if_chain.enable = conf.enable;
                 ctx_if_chain.rf_chain = conf.rf_chain;
@@ -1580,14 +1595,15 @@ impl LgwHal for Hal {
 
 
     fn lgw_demod_setconf(&mut self, conf: &LgwConfDemod) {
-        self.ctx.demod_cfg.multisf_datarate = conf.multisf_datarate
+        let mut ctx = self.ctx.write().unwrap();
+
+        ctx.demod_cfg.multisf_datarate = conf.multisf_datarate
     }
 
-    fn lgw_get_temperature(&mut self) -> Result<f32> {
-        
-        let status = self.mcu.get_mcu_status()?;
+    fn lgw_get_temperature(& self) -> Result<f32> {
+        let mut mcu = self.mcu.write().unwrap();
+        let status = mcu.get_mcu_status()?;
         Ok(status.temperature)
- 
     }
 }
 

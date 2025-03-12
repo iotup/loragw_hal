@@ -1,13 +1,14 @@
 use anyhow::{anyhow,Result};
 use tracing::{debug, error, info};
 use super::helper::wait_ms;
+use super::loragw_sx1302::SX1302;
 use super::{loragw_com::LgwSpiMuxTarget, mcu::command::{ECmdSpiTarget, MCU_SPI_REQ_TYPE_READ_WRITE}, Hal, LGW_RF_CHAIN_NB};
 
 
 const    STDBY_RC :u8               = 0x00;
 const    STDBY_XOSC:u8              = 0x01;
 
-#[allow(non_camel_case_types)]
+#[allow(non_camel_case_types,dead_code)]
 #[repr(u8)]
 pub enum Sx1250OpCode {
     CALIBRATE               = 0x89,
@@ -64,7 +65,7 @@ pub trait LoragwSx1250Trait {
     fn sx1250_reg_r(&mut self, op_code: Sx1250OpCode,  data:&mut [u8], size: usize, rf_chain:u8)->Result<()>;
 }
 
-impl LoragwSx1250Trait for Hal {
+impl LoragwSx1250Trait for SX1302 {
     fn sx1250_calibrate(&mut self, _radio:u8, _freq_hz: u32) -> Result<()> {
         Ok(())
     }
@@ -96,7 +97,9 @@ impl LoragwSx1250Trait for Hal {
         for i in 0 .. size {
             in_out_buf[i + 7] = data[i];
         }
-        if let Err(_) = self.mcu.mcu_spi_write( &mut in_out_buf ) {
+
+        let mut mcu = self.mcu.write().unwrap();
+        if let Err(_) = mcu.mcu_spi_write( &mut in_out_buf ) {
             error!("ERROR: USB SX1250 READ FAILURE\n");
             return Err(anyhow!("LGW_COM_ERR"))
         }
@@ -153,7 +156,9 @@ impl LoragwSx1250Trait for Hal {
             in_out_buf[i + 7] = data[i];
         }
 
-        if let Err(e) = self.mcu.mcu_spi_write(&mut in_out_buf) {
+        let mut mcu = self.mcu.write().unwrap();
+
+        if let Err(e) = mcu.mcu_spi_write(&mut in_out_buf) {
             error!("ERROR: USB SX1250 WRITE FAILURE\n");
             return Err(e)
         }

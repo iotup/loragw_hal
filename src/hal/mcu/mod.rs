@@ -11,7 +11,7 @@ use crate::hal::{error::Error, loragw_com::LgwSpiMuxTarget};
 
 const MAX_SIZE_COMMAND:usize =  4200;
 const MAX_SPI_COMMAND:usize  =   MAX_SIZE_COMMAND - CommandOrderOffset::Data as usize - 1 ;
-const LGW_USB_BURST_CHUNK:usize =  4096 ;
+
 
 const HEADER_CMD_SIZE:usize = 4;
 
@@ -61,12 +61,13 @@ impl PingInfo {
     
 }
 
+const LGW_USB_BURST_CHUNK:usize =  4096 ;
+
 #[derive(Debug)]
 pub struct SpiReqBulk {
     pub size: usize,
     pub nb_req: u8,
-    pub buffer: [u8; LGW_USB_BURST_CHUNK],
-    
+    pub buffer: [u8; LGW_USB_BURST_CHUNK], 
 }
 
 #[derive(Debug)]
@@ -75,8 +76,6 @@ pub struct Mcu {
     pub ping_info: Option<PingInfo>,
     pub status: Option<Status>,
     pub spi_req_bulk: SpiReqBulk,
-    pub lgw_write_mode: EComWriteMode,
-    pub lgw_spi_req_nb: u8
 }
 
 impl Mcu {
@@ -89,9 +88,7 @@ impl Mcu {
                 size: 0,
                 nb_req: 0,
                 buffer: [0u8; LGW_USB_BURST_CHUNK]
-            },
-            lgw_write_mode: EComWriteMode::LGW_COM_WRITE_MODE_SINGLE,
-            lgw_spi_req_nb: 0
+            }
         }
     }
     
@@ -119,8 +116,8 @@ impl Mcu {
             return Err(anyhow!("Data too long"));
         }
 
-        let mut rng = rand::thread_rng();
-        buf_w[0] = rng.gen::<u8>();
+        let mut rng = rand::rng();
+        buf_w[0] = rng.random::<u8>();
         buf_w[1] = (payload.len() >> 8) as u8; // MSB
         buf_w[2] = (payload.len() & 0xFF) as u8; // LSB
         buf_w[3] = order as u8;
@@ -337,174 +334,7 @@ impl Mcu {
         Ok(())
     }
 
-    pub fn mcu_set_write_mode(&mut self, mode:EComWriteMode) {
-        self.lgw_write_mode = mode;
-    }
+    
 }
 
-pub trait McuTrait {
-    fn lgw_rb(&mut self, spi_mux_target: LgwSpiMuxTarget, address:u16, data: &mut [u8], size: usize) -> Result<()>;
-    fn lgw_wb(&mut self, spi_mux_target: LgwSpiMuxTarget, address:u16, data: &[u8], size: usize) -> Result<()>;
-    fn lgw_rmw(&mut self, spi_mux_target:LgwSpiMuxTarget, address:u16,  offs:u8,  leng:u8,  data:u8) -> Result<()>;
-    fn lgw_flush(&mut self)->Result<()>;
-    fn lgw_disconnect(&mut self) -> Result<()>;
-}
 
-impl McuTrait for Mcu {
-    fn lgw_disconnect(&mut self) -> Result<()> {
-
-
-        /* Reset SX1302 before closing */
-        let e1 = self.mcu_gpio_write(0, 1, 1); /*   set PA1 : POWER_EN */
-        let e2 = self.mcu_gpio_write( 0, 2, 1); /*   set PA2 : SX1302_RESET active */
-        let e3 =self.mcu_gpio_write( 0, 2, 0); /* unset PA2 : SX1302_RESET inactive */
-        /* Reset SX1261 (LBT / Spectral Scan) */
-        let e4 = self.mcu_gpio_write( 0, 8, 0); /*   set PA8 : SX1261_NRESET active */
-        let e5 = self.mcu_gpio_write( 0, 8, 1); /* unset PA8 : SX1261_NRESET inactive */
-        if e1.is_err() || e2.is_err() || e3.is_err() || e4.is_err() || e5.is_err() {
-            error!("ERROR: failed to reset SX1302\n");
-            return Err(Error::LGW_USB_ERROR.into());
-        }
-
-        /* close file & deallocate file descriptor */
-
-        self.close();
-
-
-        Ok(())
-
-    }
-    fn lgw_flush(&mut self)->Result<()> {
-
-
-        if self.lgw_write_mode != EComWriteMode::LGW_COM_WRITE_MODE_BULK {
-            error!("ERROR: cannot flush in single write mode\n");
-            return Err(Error::LGW_COM_ERROR.into());
-        }
-    
-        /* Restore single mode after flushing */
-        self.lgw_write_mode = EComWriteMode::LGW_COM_WRITE_MODE_SINGLE;
-    
-        if self.lgw_spi_req_nb == 0 {
-            debug!("INFO: no SPI request to flush\n");
-            return Ok(())
-        }
-    
-
-    
-        debug!("INFO: flushing USB write buffer\n");
-        if let Err(_) = self.mcu_spi_flush(){
-            error!("ERROR: Failed to flush USB write buffer\n");
-            return Err(Error::LGW_COM_ERROR.into());
-        }
-    
-        /* reset the pending request number */
-        self.lgw_spi_req_nb = 0;
-    
-        return Ok(())
-    }
-    /* Burst (multiple-byte) read */
-    fn lgw_rb(&mut self, spi_mux_target: LgwSpiMuxTarget, address:u16, data: &mut [u8], size: usize) -> Result<()> {
-      
-        let command_size = size + 9;  /* 5 bytes: REQ metadata (MCU), 3 bytes: SPI header (SX1302), 1 byte: dummy*/
-        let mut in_out_buf = vec![0u8; command_size];
-
-        /* prepare command */
-        /* Request metadata */
-        in_out_buf[0] = 0; /* Req ID */
-        in_out_buf[1] = MCU_SPI_REQ_TYPE_READ_WRITE ;// MCU_SPI_REQ_TYPE_READ_WRITE; /* Req type */
-        in_out_buf[2] = ECmdSpiTarget::MCU_SPI_TARGET_SX1302 as u8; /* MCU -> SX1302 */
-        in_out_buf[3] = ((size + 4) >> 8) as u8; /* payload size + spi_mux_target + address + dummy byte */
-        in_out_buf[4] = ((size + 4) >> 0) as u8; /* payload size + spi_mux_target + address + dummy byte */
-        /* RAW SPI frame */
-        in_out_buf[5] = spi_mux_target as u8; /* SX1302 -> RADIO_A or RADIO_B */
-        in_out_buf[6] = ( 0x00 | ((address >> 8) & 0x7F)) as u8;
-        in_out_buf[7] =        ((address >> 0) & 0xFF) as u8;
-        in_out_buf[8] = 0x00; /* dummy byte */
-
-        for i in 0..size {
-            in_out_buf[i + 9] = data[i];
-        }
-     
-
-        if self.lgw_write_mode == EComWriteMode::LGW_COM_WRITE_MODE_BULK{
-            /* makes no sense to read in bulk mode, as we can't get the result */
-            return Err(anyhow!("ERROR: USB READ BURST FAILURE - bulk mode is enabled"))
-        } else {
-            if let Err(e) = self.mcu_spi_write( &mut in_out_buf) {
-                error!("ERROR: USB READ BURST FAILURE");
-                return Err(e);
-            }
-        }
-
-    
-        trace!("Note: USB read burst success");
-        for i in 0..size {
-            data[i] = in_out_buf[9+i]
-        }
-        
-        Ok(())
-        
-    }
-    
-    fn lgw_rmw(&mut self, _spi_mux_target:LgwSpiMuxTarget, address:u16,  offs:u8,  leng:u8,  data:u8) -> Result<()> {
-        let command_size: usize = 6;
-        let mut in_out_buf = vec![0u8;command_size];
-
-        trace!("==> RMW register @ 0x{:04X}, offs:{:} leng:{:} value:0x{:02X}", address, offs, leng, data);
-
-        /* prepare frame to be sent */
-        in_out_buf[0] = self.lgw_spi_req_nb; /* Req ID */
-        in_out_buf[1] = MCU_SPI_REQ_TYPE_READ_MODIFY_WRITE as u8; /* Req type */
-        in_out_buf[2] = (address >> 8) as u8; /* Register address MSB */
-        in_out_buf[3] = (address >> 0) as u8; /* Register address LSB */
-        in_out_buf[4] = ((1 << leng) - 1) << offs; /* Register bitmask */
-        in_out_buf[5] = data << offs;
-
-        if self.lgw_write_mode == EComWriteMode::LGW_COM_WRITE_MODE_BULK {
-            self.mcu_spi_store(&mut in_out_buf)?;
-            self.lgw_spi_req_nb += 1;
-        } else {
-            self.mcu_spi_write(&mut in_out_buf)?;
-        }
-
-        Ok(())
-    }
-    
-    fn lgw_wb(&mut self, spi_mux_target: LgwSpiMuxTarget, address:u16, data: &[u8], size: usize) -> Result<()> {
-    
-        let command_size = size + 8; /* 5 bytes: REQ metadata (MCU), 3 bytes: SPI header (SX1302) */
-        let mut in_out_buf = vec![0u8;command_size];
-
-        if data.is_empty() {
-            return Err(anyhow!("ERROR: empty data array"))
-        }
-
-
-        /* prepare command */
-        /* Request metadata */
-        in_out_buf[0] = self.lgw_spi_req_nb; /* Req ID */
-        in_out_buf[1] = MCU_SPI_REQ_TYPE_READ_WRITE as u8; /* Req type */
-        in_out_buf[2] = ECmdSpiTarget::MCU_SPI_TARGET_SX1302 as u8; /* MCU -> SX1302 */
-        in_out_buf[3] = ((size + 3) >> 8) as u8; /* payload size + spi_mux_target + address */
-        in_out_buf[4] = ((size + 3) >> 0) as u8; /* payload size + spi_mux_target + address */
-        /* RAW SPI frame */
-        in_out_buf[5] = spi_mux_target as u8; /* SX1302 -> RADIO_A or RADIO_B */
-        in_out_buf[6] = 0x80 | ((address >> 8) & 0x7F) as u8;
-        in_out_buf[7] =        ((address >> 0) & 0xFF) as u8;
-        for i in 0..size {
-            in_out_buf[i + 8] = data[i];
-        }
-
-        if self.lgw_write_mode == EComWriteMode::LGW_COM_WRITE_MODE_BULK {
-            self.mcu_spi_store(&mut in_out_buf).map_err(|e| anyhow!("ERROR: USB WRITE BURST FAILURE: {:}", e))?;
-            self.lgw_spi_req_nb += 1;
-        } else {
-            self.mcu_spi_write(&mut in_out_buf).map_err(|e| anyhow!("ERROR: USB WRITE BURST FAILURE: {:}", e))?;
-        }
-
-        trace!("Note: USB write burst success\n");
-
-        Ok(())
-    }
-}

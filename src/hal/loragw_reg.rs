@@ -1,10 +1,13 @@
+#![allow(dead_code)]
+
 use anyhow::{anyhow,Result};
-use tracing::{debug, error, info, trace};
+use tracing::{ error, trace};
 
 use super::error::Error;
-use super::loragw_com::LoragwComTrait;
 
-use super::{loragw_com::LgwSpiMuxTarget, mcu::command::{ECmdSpiTarget, EComWriteMode, MCU_SPI_REQ_TYPE_READ_WRITE}, Hal};
+use super::loragw_com::LgwComTrait;
+use super::loragw_sx1302::SX1302;
+use super::loragw_com::LgwSpiMuxTarget;
 use std::fmt;
 
 const SX1302_REG_EXT_MEM_PAGED_BASE_ADDR: u16 = 0x0;
@@ -2161,26 +2164,21 @@ pub const LOREGS: [LgwReg; LGW_TOTALREGS as usize + 1] = [
 
 
 pub trait LoragwRegTrait {
-    fn lgw_connect(&mut self) -> Result<()>;
+   
     fn lgw_reg_w(&mut self,  register_id: u16,  reg_value: i32) -> Result<()>;
     fn reg_w(&mut self,  spi_mux_target: LgwSpiMuxTarget, r:LgwReg,  reg_value:i32) -> Result<()>;
     fn lgw_reg_r(&mut self, register_id: u16) -> Result<i32>;
     fn reg_r(&mut self, spi_mux_target:LgwSpiMuxTarget,  r:LgwReg) -> Result<i32>;
-    fn lgw_mem_wb(&mut self,  mem_addr:u16,  data:&[u8],  size:usize)->Result<()>;
-    fn lgw_wb(&mut self,  spi_mux_target:LgwSpiMuxTarget,  address: u16,  data: &[u8],  size:usize)-> Result<()>;
-    fn lgw_mem_rb(&mut self,  mem_addr: u16, data:&mut [u8],  size: usize,  fifo_mode: bool)-> Result<()> ;
-    fn lgw_rb(&mut self,  spi_mux_target: LgwSpiMuxTarget,  address: u16,  data:&mut [u8],  size: usize) -> Result<()>;
     fn lgw_reg_rb(&mut self,  register_id:u16,  data:&mut [u8],  size:usize)-> Result<()>;
     fn lgw_reg_wb(&mut self, register_id:u16,  data:&[u8],  size: usize) -> Result<()>;
 }
 
-const CHUNK_SIZE_MAX:usize = 256;
 
-impl LoragwRegTrait for Hal {
+
+impl LoragwRegTrait for SX1302 {
 
     fn lgw_reg_wb(&mut self, register_id:u16,  data:&[u8],  size: usize) -> Result<()> {
     
-
         if size == 0 || data.is_empty() {
             error!("ERROR: BURST OF NULL LENGTH\n");
             return Err(Error::LGW_REG_ERROR.into());
@@ -2236,171 +2234,10 @@ impl LoragwRegTrait for Hal {
 
     }
 
-    fn lgw_rb(&mut self,  spi_mux_target: LgwSpiMuxTarget,  address: u16,  data:&mut [u8],  size: usize) -> Result<()> {
-
-        let command_size = size + 9;  /* 5 bytes: REQ metadata (MCU), 3 bytes: SPI header (SX1302), 1 byte: dummy*/
-        let mut in_out_buf= vec![0u8;command_size];
 
     
-        if data.is_empty() {
-            return Err(anyhow!("LGW_REG_ERROR"))
-        }
+
     
-        /* prepare command */
-        /* Request metadata */
-        in_out_buf[0] = 0; /* Req ID */
-        in_out_buf[1] = MCU_SPI_REQ_TYPE_READ_WRITE; /* Req type */
-        in_out_buf[2] = ECmdSpiTarget::MCU_SPI_TARGET_SX1302 as u8; /* MCU -> SX1302 */
-        in_out_buf[3] = ((size + 4) >> 8) as u8; /* payload size + spi_mux_target + address + dummy byte */
-        in_out_buf[4] = ((size + 4) >> 0) as u8; /* payload size + spi_mux_target + address + dummy byte */
-        /* RAW SPI frame */
-        in_out_buf[5] = spi_mux_target as u8; /* SX1302 -> RADIO_A or RADIO_B */
-        in_out_buf[6] = 0x00 | ((address >> 8) & 0x7F) as u8;
-        in_out_buf[7] =        ((address >> 0) & 0xFF) as u8;
-        in_out_buf[8] = 0x00; /* dummy byte */
-        for i in 0 .. size {
-            in_out_buf[i + 9] = data[i];
-        }
-    
-        if self.mcu.lgw_write_mode == EComWriteMode::LGW_COM_WRITE_MODE_BULK {
-            /* makes no sense to read in bulk mode, as we can't get the result */
-            error!("ERROR: USB READ BURST FAILURE - bulk mode is enabled\n");
-            return Err(anyhow!("LGW_REG_ERROR"))
-        } else {
-            self.mcu.mcu_spi_write( &mut in_out_buf)?;
-        }
-    
-   
-        trace!("Note: USB read burst success\n");
-
-        for i in 0 .. size {
-            data[i] = in_out_buf[9 + i];
-        }
-        
-        Ok(())
-    }
-
-
-    /* Burst (multiple-byte) write */
-    fn lgw_wb(&mut self,  spi_mux_target:LgwSpiMuxTarget,  address: u16,  data: &[u8],  size:usize)-> Result<()> {
-
-        let command_size = size + 8; /* 5 bytes: REQ metadata (MCU), 3 bytes: SPI header (SX1302) */
-        let mut in_out_buf=vec![0u8;command_size];
-
-
-        if data.is_empty() {
-            return Err(anyhow!("LGW_REG_ERR"));
-        }
-
-        /* prepare command */
-        /* Request metadata */
-        in_out_buf[0] = self.mcu.lgw_spi_req_nb; /* Req ID */
-        in_out_buf[1] = MCU_SPI_REQ_TYPE_READ_WRITE; /* Req type */
-        in_out_buf[2] = ECmdSpiTarget::MCU_SPI_TARGET_SX1302 as u8; /* MCU -> SX1302 */
-        in_out_buf[3] = ((size + 3) >> 8) as u8; /* payload size + spi_mux_target + address */
-        in_out_buf[4] = ((size + 3) >> 0) as u8; /* payload size + spi_mux_target + address */
-        /* RAW SPI frame */
-        in_out_buf[5] = spi_mux_target as u8; /* SX1302 -> RADIO_A or RADIO_B */
-        in_out_buf[6] = 0x80 | ((address >> 8) & 0x7F) as u8;
-        in_out_buf[7] =        ((address >> 0) & 0xFF) as u8;
-        for i in 0 .. size {
-            in_out_buf[i + 8] = data[i];
-        }
-
-        if self.mcu.lgw_write_mode == EComWriteMode::LGW_COM_WRITE_MODE_BULK {
-            self.mcu.mcu_spi_store(&in_out_buf)?;
-            self.mcu.lgw_spi_req_nb += 1;
-        } else {
-            self.mcu.mcu_spi_write( &mut in_out_buf )?;
-        }
-        Ok(())
-    }
-
-    fn lgw_mem_wb(&mut self,  mem_addr:u16,  data:&[u8],  size:usize)->Result<()> {
-
-        let mut chunk_cnt = 0;
-        let mut addr = mem_addr;
-        let mut sz_todo = size;
-
-        
-        debug!("lgw_mem_wb");
-        /* check input parameters */
-        
-        if data.is_empty() || size == 0 {
-            error!("ERROR: BURST OF NULL LENGTH\n");
-            return Err(anyhow!("LGW_REG_ERR"));
-        }
-
-        /* write memory by chunks */
-        while sz_todo > 0 {
-            
-            /* full or partial chunk ? */
-            let chunk_size = if sz_todo  > CHUNK_SIZE_MAX { CHUNK_SIZE_MAX }   else { sz_todo };
-            trace!(chunk_cnt=%chunk_cnt, chunk_size=%chunk_size);
-
-            let bulk = &data[chunk_cnt * CHUNK_SIZE_MAX  .. (chunk_cnt * CHUNK_SIZE_MAX  + chunk_size)];
-            /* do the burst write */
-            self.lgw_wb(LgwSpiMuxTarget::LGW_SPI_MUX_TARGET_SX1302, addr, &bulk, chunk_size)?;
-
-            /* prepare for next write */
-            addr += chunk_size as u16;
-            sz_todo -= chunk_size;
-            chunk_cnt += 1;  
-        }
-
-        Ok(())
-    }
-
-    /* ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ */
-
-    fn lgw_mem_rb(&mut self,  mem_addr: u16, data:&mut [u8],  size: usize,  fifo_mode: bool)-> Result<()> {
-
-        let mut chunk_cnt = 0;
-        let mut addr = mem_addr;
-        let mut sz_todo = size;
-        
-
-
-        if data.is_empty() || size == 0 {
-            error!("ERROR: BURST OF NULL LENGTH\n");
-            return Err(anyhow!("LGW_REG_ERR"));
-        }
-
-        /* read memory by chunks */
-        while sz_todo > 0 {
-            /* full or partial chunk ? */
-            let chunk_size = if sz_todo  > CHUNK_SIZE_MAX as usize  { CHUNK_SIZE_MAX as usize} else { sz_todo  } ;
-
-            let bulk = &mut data[chunk_cnt * CHUNK_SIZE_MAX  .. (chunk_cnt * CHUNK_SIZE_MAX  + chunk_size)];
-            /* do the burst read */
-            self.lgw_rb(LgwSpiMuxTarget::LGW_SPI_MUX_TARGET_SX1302, addr,  bulk, chunk_size)?;
-
-            /* do not increment the address when the target memory is in FIFO mode (auto-increment) */
-            if fifo_mode == false {
-                addr += chunk_size as u16;
-            }
-
-            /* prepare for next read */
-            sz_todo -= chunk_size;
-            chunk_cnt += 1;
-        }
-
-        Ok(())
-    }
-
-    fn lgw_connect(&mut self) -> Result<()> {
-        let mut u= [0u8; 1];
-
-        self.lgw_com_open()?;
-
-        /* check SX1302 version */
-        self.lgw_com_r(LgwSpiMuxTarget::LGW_SPI_MUX_TARGET_SX1302, LOREGS[SX1302_REG_COMMON_VERSION_VERSION as usize].addr, &mut u, 1)?;
-
-        info!("Note: chip version is {:02X} (v{:}.{:})", u[0], (u[0] >> 4) & 0x0F, u[0] & 0x0F) ;
-
-        info!("Note: success connecting the concentrator");
-        Ok(())
-    }
 
     fn reg_r(&mut self, spi_mux_target:LgwSpiMuxTarget,  r:LgwReg) -> Result<i32> {
     
@@ -2409,7 +2246,7 @@ impl LoragwRegTrait for Hal {
     
         if (r.offs + r.leng) <= 8 {
             /* read one byte, then shift and mask bits to get reg value with sign extension if needed */
-            self.lgw_com_r(spi_mux_target, r.addr, &mut bufu, 1)?;
+            self.lgw_rb(spi_mux_target, r.addr, &mut bufu, 1)?;
             bufu[1] = bufu[0] << (8 - r.leng - r.offs); /* left-align the data */
             if r.sign == true {
                 let u1 = bufu[1] as i8;
@@ -2433,13 +2270,15 @@ impl LoragwRegTrait for Hal {
         if (r.leng == 8) && (r.offs == 0) {
             /* direct write */
             trace!("==> DIRECT WRITE @ {:04X}", r.addr);
+            let mut data = vec![0u8;1];
+            data[0] = reg_value as u8;
 
-            self.lgw_com_w(spi_mux_target, r.addr, reg_value as u8)?;
+            self.lgw_wb(spi_mux_target, r.addr, &data, 1)?;
         } else if (r.offs + r.leng) <= 8 {
             /* read-modify-write */
             trace!("==> READ MODIFY WRITE @ {:04X} (offs:{:} leng:{:})\n", r.addr, r.offs, r.leng);
 
-            self.lgw_com_rmw(spi_mux_target, r.addr, r.offs, r.leng, reg_value as u8)?;
+            self.lgw_rmw(spi_mux_target, r.addr, r.offs, r.leng, reg_value as u8)?;
         } else {
             trace!("ERROR: REGISTER SIZE AND OFFSET ARE NOT SUPPORTED");
 

@@ -1,10 +1,12 @@
 #![allow(unused_macros)]
-#![allow(non_snake_case)]
+#![allow(non_snake_case, dead_code)]
+
+use std::sync::{Arc, RwLock};
 
 use anyhow::{anyhow,Result};
 use tracing::{debug, error, info, trace, warn};
-use crate::hal::{ cal_fw::CAL_FIRMWARE_SX125X, LgwFtimeMode, loragw_agc_params::{AGC_PARAMS_SX1250, AGC_PARAMS_SX125X}, loragw_sx1250::LoragwSx1250Trait, loragw_sx1302_timestamp::timestamp_counter_correction, mcu::McuTrait, Modulation, TxMode, BW_125KHZ, BW_250KHZ, BW_500KHZ, BW_UNDEFINED, CR_LORA_4_5, CR_LORA_4_6, CR_LORA_4_7, CR_LORA_4_8, CR_UNDEFINED, DR_UNDEFINED, LGW_MULTI_NB, STAT_CRC_BAD, STAT_CRC_OK, STAT_NO_CRC, STAT_UNDEFINED};
-use super::{LgwConfigBoard, LgwConfDemod, LgwConfigFtime, LgwConfRxIf, LgwConfRxrf, LgwPktRx, LgwPktTx, LgwRadioType, LgwTxGainLut, loragw_sx1302_timestamp::{TimestampCounter, TimestampPpsHistory, SX1302TimestampTrait, MAX_TIMESTAMP_PPS_HISTORY}, mcu::command::EComWriteMode, Hal, LoragwRegTrait, DR_LORA_SF10, DR_LORA_SF11, DR_LORA_SF12, DR_LORA_SF5, DR_LORA_SF6, DR_LORA_SF7, DR_LORA_SF8, DR_LORA_SF9, LGW_IF_CHAIN_NB, LGW_RF_CHAIN_NB, RX_STATUS_UNKNOWN, TX_EMITTING, TX_FREE, TX_SCHEDULED, TX_STATUS_UNKNOWN};
+use crate::hal::{ cal_fw::CAL_FIRMWARE_SX125X, loragw_agc_params::{AGC_PARAMS_SX1250, AGC_PARAMS_SX125X}, loragw_com::LgwComTrait, loragw_sx1250::LoragwSx1250Trait, loragw_sx1302_timestamp::timestamp_counter_correction, LgwFtimeMode, Modulation, TxMode, BW_125KHZ, BW_250KHZ, BW_500KHZ, BW_UNDEFINED, CR_LORA_4_5, CR_LORA_4_6, CR_LORA_4_7, CR_LORA_4_8, CR_UNDEFINED, DR_UNDEFINED, LGW_MULTI_NB, STAT_CRC_BAD, STAT_CRC_OK, STAT_NO_CRC, STAT_UNDEFINED};
+use super::{loragw_sx1302_timestamp::{ SX1302TimestampTrait, TimestampCounter, TimestampPpsHistory, MAX_TIMESTAMP_PPS_HISTORY}, mcu::{command::EComWriteMode, Mcu}, Hal, LgwConfDemod, LgwConfRxIf, LgwConfRxrf, LgwConfigBoard, LgwConfigFtime, LgwContext, LgwPktRx, LgwPktTx, LgwRadioType, LgwTxGainLut, LoragwRegTrait, DR_LORA_SF10, DR_LORA_SF11, DR_LORA_SF12, DR_LORA_SF5, DR_LORA_SF6, DR_LORA_SF7, DR_LORA_SF8, DR_LORA_SF9, LGW_IF_CHAIN_NB, LGW_RF_CHAIN_NB, RX_STATUS_UNKNOWN, TX_EMITTING, TX_FREE, TX_SCHEDULED, TX_STATUS_UNKNOWN};
 use crate::hal::helper::wait_ms;
 use super::error::Error;
 use libm::{ceil, fabs};
@@ -1609,26 +1611,39 @@ impl RxBuffer {
     }
 }
 
+
 #[derive(Debug)]
-pub struct Sx1302 {
+pub struct SX1302 {
+    pub mcu: Arc<RwLock<Mcu>>,
+    pub write_mode: EComWriteMode,
+    pub spi_req_nb: u8,
+    pub ctx: Arc<RwLock<LgwContext>>,
     /* Buffer to hold RX data */
     pub rx_buffer: RxBuffer,
-
     /* Internal timestamp counter */
     pub counter_us: TimestampCounter,
-
     pub timestamp_pps_history: TimestampPpsHistory
 }
 
-impl Sx1302 {
-    pub fn new() -> Self {
+impl SX1302 {
+    pub fn new( mcu: Arc<RwLock<Mcu>>, ctx: Arc<RwLock<LgwContext>> ) -> Self {
         Self {
+            mcu: mcu,
+            ctx: ctx,
             rx_buffer: RxBuffer::new(),
             counter_us: TimestampCounter::new(),
-            timestamp_pps_history: TimestampPpsHistory::new()
+            timestamp_pps_history: TimestampPpsHistory::new(),
+            write_mode: EComWriteMode::LGW_COM_WRITE_MODE_SINGLE,
+            spi_req_nb: 0,
         }
     }
+
+    pub fn set_write_mode(&mut self, mode:EComWriteMode) {
+        self.write_mode = mode;
+    }
+
 }
+
 
 pub trait LorgwSx1302Trait {
     fn sx1302_rx_status(&mut self,  rf_chain: u8) -> u8;
@@ -1726,13 +1741,11 @@ pub trait LorgwSx1302Trait {
     fn sx1302_tx_abort(&mut self,  rf_chain:u8) -> Result<()>;
 
     fn sx1302_tx_status(&mut self, rf_chain:u8) -> u8;
-}   
+}  
 
 
 
-
-impl LorgwSx1302Trait for Hal {
-
+impl LorgwSx1302Trait for SX1302 {
 
     fn sx1302_tx_status(&mut self, rf_chain:u8) -> u8 {
         let read_value;
@@ -1871,9 +1884,6 @@ impl LorgwSx1302Trait for Hal {
     
         Ok(delay)
     }
-    
-   
-    
 
     fn sx1302_send(&mut self,  radio_type: LgwRadioType,  tx_lut: &LgwTxGainLut,  lwan_public: bool, context_fsk: &LgwConfRxIf,  pkt_data: &mut LgwPktTx) -> Result<()> {
         
@@ -1889,10 +1899,10 @@ impl LorgwSx1302Trait for Hal {
         let pa_en:u8;
         let mut chirp_lowpass:u8 = 0;
         let mut buff = [0u8;2]; /* for 16-bits register write operation */
-
+       
     
         /* Setting BULK write mode (to speed up configuration on USB) */
-        self.mcu.mcu_set_write_mode(EComWriteMode::LGW_COM_WRITE_MODE_BULK);
+        self.set_write_mode(EComWriteMode::LGW_COM_WRITE_MODE_BULK);
     
         /* Select the proper modem */
         match pkt_data.modulation {
@@ -2237,11 +2247,11 @@ impl LorgwSx1302Trait for Hal {
         }
     
         /* Flush write (USB BULK mode) */
-        self.mcu.lgw_flush()?;
+        self.lgw_flush()?;
         
     
         /* Setting back to SINGLE BULK write mode */
-        self.mcu.mcu_set_write_mode(EComWriteMode::LGW_COM_WRITE_MODE_SINGLE);
+        self.set_write_mode(EComWriteMode::LGW_COM_WRITE_MODE_SINGLE);
         
     
         Ok(())
@@ -2284,18 +2294,18 @@ impl LorgwSx1302Trait for Hal {
         let mut counter_inst_us_raw_27bits_now = ((buff[4] as u32) <<24) | ((buff[5] as u32)<<16) | ((buff[6] as u32)<<8) | buff[7] as u32;
 
         /* Store PPS counter to history, for fine timestamp calculation */
-        self.sx1302.timestamp_pps_history.save(counter_pps_us_raw_27bits_now);
+        self.timestamp_pps_history.save(counter_pps_us_raw_27bits_now);
 
         /* Scale to 1MHz */
         counter_pps_us_raw_27bits_now /= 32;
         counter_inst_us_raw_27bits_now /= 32;
 
         /* Update counter wrapping status */
-        self.sx1302.counter_us.update( counter_pps_us_raw_27bits_now, counter_inst_us_raw_27bits_now);
+        self.counter_us.update( counter_pps_us_raw_27bits_now, counter_inst_us_raw_27bits_now);
 
         /* Convert 27-bits counter to 32-bits counter */
-        let inst = self.sx1302.counter_us.expand( false, counter_inst_us_raw_27bits_now);
-        let pps  = self.sx1302.counter_us.expand( true, counter_pps_us_raw_27bits_now);
+        let inst = self.counter_us.expand( false, counter_inst_us_raw_27bits_now);
+        let pps  = self.counter_us.expand( true, counter_pps_us_raw_27bits_now);
 
         Ok((inst, pps))
     }
@@ -2359,33 +2369,33 @@ impl LorgwSx1302Trait for Hal {
 
             if idx != 0 {
                 debug!("INFO: re-sync rx_buffer at idx {:}\n", idx);
-                self.sx1302.rx_buffer.buffer[.. (data_size - idx)].copy_from_slice(&data_buff[ idx .. (data_size - idx)]);
+                self.rx_buffer.buffer[.. (data_size - idx)].copy_from_slice(&data_buff[ idx .. (data_size - idx)]);
                 
-                self.sx1302.rx_buffer.buffer_size = data_size - idx;
+                self.rx_buffer.buffer_size = data_size - idx;
             }
             else{
-                self.sx1302.rx_buffer.buffer[ .. data_size ].copy_from_slice(&data_buff[0 .. data_size]);
-                self.sx1302.rx_buffer.buffer_size = data_size;
+                self.rx_buffer.buffer[ .. data_size ].copy_from_slice(&data_buff[0 .. data_size]);
+                self.rx_buffer.buffer_size = data_size;
             }
 
             /* Rewind and parse buffer to get the number of packet fetched */
             idx = 0;
-            while idx < self.sx1302.rx_buffer.buffer_size {
-                if self.sx1302.rx_buffer.buffer[idx] != SX1302_PKT_SYNCWORD_BYTE_0 || (self.sx1302.rx_buffer.buffer[idx + 1] != SX1302_PKT_SYNCWORD_BYTE_1) {
+            while idx < self.rx_buffer.buffer_size {
+                if self.rx_buffer.buffer[idx] != SX1302_PKT_SYNCWORD_BYTE_0 || (self.rx_buffer.buffer[idx + 1] != SX1302_PKT_SYNCWORD_BYTE_1) {
                     debug!("WARNING: syncword not found at idx {:}, discard the rx_buffer\n", idx);
-                    self.sx1302.rx_buffer.del();
+                    self.rx_buffer.del();
                     return Ok(());
                 }
 
                 /* One packet found in the buffer */
-                self.sx1302.rx_buffer.buffer_pkt_nb += 1;
+                self.rx_buffer.buffer_pkt_nb += 1;
 
                 /* Compute the number of bytes for this packet */
-                let payload_len = SX1302_PKT_PAYLOAD_LENGTH!(self.sx1302.rx_buffer.buffer, idx) as u8;
+                let payload_len = SX1302_PKT_PAYLOAD_LENGTH!(self.rx_buffer.buffer, idx) as u8;
                 let next_pkt_idx =  SX1302_PKT_HEAD_METADATA +
                                 payload_len +
                                 SX1302_PKT_TAIL_METADATA +
-                                (2 * SX1302_PKT_NUM_TS_METRICS!(self.sx1302.rx_buffer.buffer, idx + payload_len as usize)) as u8;
+                                (2 * SX1302_PKT_NUM_TS_METRICS!(self.rx_buffer.buffer, idx + payload_len as usize)) as u8;
 
                 /* Move to next packet */
                 idx += next_pkt_idx as usize;
@@ -2423,9 +2433,9 @@ impl LorgwSx1302Trait for Hal {
     fn sx1302_fetch(&mut self)->Result<u8> {
     
         /* Fetch packets from sx1302 if no more left in RX buffer */
-        if self.sx1302.rx_buffer.buffer_pkt_nb == 0 {
+        if self.rx_buffer.buffer_pkt_nb == 0 {
             /* Initialize RX buffer */
-            self.sx1302.rx_buffer.clear();
+            self.rx_buffer.clear();
 
             /* Fetch RX buffer if any data available */
             if let Err(err) = self.rx_buffer_fetch(){
@@ -2434,17 +2444,17 @@ impl LorgwSx1302Trait for Hal {
                 return Err(anyhow!("LGW_REG_ERR"));
             }
             else{
-                trace!("Note: fetch {:} pkts from sx1302", self.sx1302.rx_buffer.buffer_pkt_nb);
+                trace!("Note: fetch {:} pkts from sx1302", self.rx_buffer.buffer_pkt_nb);
             }
         } else {
-            debug!("Note: remaining {:} packets in RX buffer, do not fetch sx1302 yet...\n", self.sx1302.rx_buffer.buffer_pkt_nb);
+            debug!("Note: remaining {:} packets in RX buffer, do not fetch sx1302 yet...\n", self.rx_buffer.buffer_pkt_nb);
         }
 
         /* Return the number of packet fetched */
         
        
         
-        let nb_pkt = self.sx1302.rx_buffer.buffer_pkt_nb;
+        let nb_pkt = self.rx_buffer.buffer_pkt_nb;
         Ok(nb_pkt)
     }
 
@@ -3920,13 +3930,12 @@ impl LorgwSx1302Trait for Hal {
         IFMOD_CONFIG[if_chain as usize]
     }
 
-
-
-
     fn sx1302_parse(&mut self) -> Result<LgwPktRx> {
         
-        let context = &self.ctx;
-        let rx_buffer = &mut self.sx1302.rx_buffer;
+        let context = self.ctx.clone();
+        let context = context.read().unwrap();
+        
+        let rx_buffer = &mut self.rx_buffer;
         let timestamp_correction = 0;
         
         /* get packet from RX buffer */
@@ -4066,21 +4075,25 @@ impl LorgwSx1302Trait for Hal {
             p.freq_offset += if_freq_error;
     
             /* Get timestamp correction to be applied to count_us */
-            let _timestamp_correction = timestamp_counter_correction(context, p.bandwidth, p.datarate as u8, p.coderate, pkt.crc_en, pkt.rxbytenb_modem, RX_DFT_PEAK_MODE_AUTO);
+            let _timestamp_correction = timestamp_counter_correction(&context, p.bandwidth, p.datarate as u8, p.coderate, pkt.crc_en, pkt.rxbytenb_modem, RX_DFT_PEAK_MODE_AUTO);
     
             /* Compute fine timestamp for packets coming from the modem optimized for fine timestamping, if CRC is OK */
             p.ftime_received = false;
             p.ftime = 0;
-            if (pkt.num_ts_metrics_stored > 0) && (pkt.timing_set == true) && (p.status == STAT_CRC_OK) {
+            /* Compute the fine timestamp  */
+            if (pkt.num_ts_metrics_stored > 0) && (pkt.timing_set == true) && (p.status == STAT_CRC_OK) 
+            {
                 /* The actual packet frequency error compared to the channel frequency, need to compute the ftime */
                 let pkt_freq_error = ((p.freq_hz as f64 + p.freq_offset as f64)  / (p.freq_hz) as f64) - 1.0;
     
-                /* Compute the fine timestamp */
-                if let Ok(ftime) = self.precise_timestamp_calculate(pkt.num_ts_metrics_stored, &pkt.timestamp_avg, pkt.timestamp_cnt, pkt.rx_rate_sf, context.if_chain_cfg[p.if_chain as usize].freq_hz, pkt_freq_error){
+                
+                if let Ok(ftime) = self.precise_timestamp_calculate(pkt.num_ts_metrics_stored, &pkt.timestamp_avg, pkt.timestamp_cnt, pkt.rx_rate_sf, context.if_chain_cfg[p.if_chain as usize].freq_hz, pkt_freq_error) {
                     p.ftime = ftime;
                     p.ftime_received = true;
                 }
+                
             }
+            
         } else if ifmod == IF_FSK_STD {
             trace!("Note: FSK packet (modem {:} chan {:})\n", pkt.modem_id, p.if_chain);
             p.modulation = Modulation::FSK;
@@ -4132,7 +4145,7 @@ impl LorgwSx1302Trait for Hal {
         p.count_us = pkt.timestamp_cnt / 32;
     
         /* Expand 27-bits counter to 32-bits counter, based on current wrapping status (updated after fetch) */
-        p.count_us = self.sx1302.counter_us.pkt_expand( p.count_us);//timestamp_pkt_expand(&counter_us, p.count_us);
+        p.count_us = self.counter_us.pkt_expand( p.count_us);//timestamp_pkt_expand(&counter_us, p.count_us);
     
         /* Packet timestamp corrected */
         p.count_us = p.count_us + timestamp_correction;
@@ -4163,7 +4176,7 @@ impl LorgwSx1302Trait for Hal {
         let mut timestamp_pps_idx  = 0;
 
         /* Check if we can calculate a ftime */
-        if self.sx1302.timestamp_pps_history.size < MAX_TIMESTAMP_PPS_HISTORY {
+        if self.timestamp_pps_history.size < MAX_TIMESTAMP_PPS_HISTORY {
             error!("INFO: Cannot compute ftime yet, PPS history is too short\n");
             return Err(anyhow!("LGW_HAL_ERROR"));
         }
@@ -4212,28 +4225,28 @@ impl LorgwSx1302Trait for Hal {
         timestamp_pps_reg |= ((buff[3] as u32) << 0)  & 0x000000FF;
 
         /* Ensure that the timestamp PPS history is up-to-date */
-        self.sx1302.timestamp_pps_history.save(timestamp_pps_reg);
+        self.timestamp_pps_history.save(timestamp_pps_reg);
         
 
         /* Check if timestamp_pps_reg we just read is the reference to be used to compute ftime or not */
         if (timestamp_cnt - timestamp_pps_reg) > 32000000u32 {
             /* The timestamp_pps_reg we just read is after the packet timestamp, we need to rewind */
-            for timestamp_pps_idx in 0 .. self.sx1302.timestamp_pps_history.size {
+            for timestamp_pps_idx in 0 .. self.timestamp_pps_history.size {
                 /* search the pps counter in history */
-                if (timestamp_cnt - self.sx1302.timestamp_pps_history.history[timestamp_pps_idx]) < 32000000u32 {
-                    timestamp_pps = self.sx1302.timestamp_pps_history.history[timestamp_pps_idx];
+                if (timestamp_cnt - self.timestamp_pps_history.history[timestamp_pps_idx]) < 32000000u32 {
+                    timestamp_pps = self.timestamp_pps_history.history[timestamp_pps_idx];
                     trace!("==> timestamp_pps found at history[{:}] => {:}\n", timestamp_pps_idx, timestamp_pps);
                     break;
                 }
             }
-            if timestamp_pps_idx == self.sx1302.timestamp_pps_history.size {
+            if timestamp_pps_idx == self.timestamp_pps_history.size {
                 error!("ERROR: failed to find the reference timestamp_pps, cannot compute ftime\n");
                 return Err(anyhow!("LGW_REG_ERROR"));
             }
 
             /* Calculate the Xtal error between the reference PPS we just found and the next one */
             let timestamp_pps_idx_next = if timestamp_pps_idx == (MAX_TIMESTAMP_PPS_HISTORY - 1) { 0 } else { timestamp_pps_idx + 1 };
-            diff_pps = self.sx1302.timestamp_pps_history.history[timestamp_pps_idx_next] - self.sx1302.timestamp_pps_history.history[timestamp_pps_idx];
+            diff_pps = self.timestamp_pps_history.history[timestamp_pps_idx_next] - self.timestamp_pps_history.history[timestamp_pps_idx];
             xtal_correct = 32e6 / (diff_pps as f64);
         } else {
             /* The timestamp_pps_reg we just read is the reference we use to calculate the fine timestamp */
@@ -4241,9 +4254,9 @@ impl LorgwSx1302Trait for Hal {
             trace!("==> timestamp_pps => {:}\n", timestamp_pps);
 
             /* Calculate the Xtal error between the reference PPS we just found and the previous one */
-            timestamp_pps_idx = self.sx1302.timestamp_pps_history.idx;
+            timestamp_pps_idx = self.timestamp_pps_history.idx;
             let timestamp_pps_idx_prev = if timestamp_pps_idx == 0 { MAX_TIMESTAMP_PPS_HISTORY - 1 } else { timestamp_pps_idx - 1 };
-            diff_pps = self.sx1302.timestamp_pps_history.history[timestamp_pps_idx] - self.sx1302.timestamp_pps_history.history[timestamp_pps_idx_prev];
+            diff_pps = self.timestamp_pps_history.history[timestamp_pps_idx] - self.timestamp_pps_history.history[timestamp_pps_idx_prev];
             xtal_correct = 32e6 / (diff_pps as f64);
         }
 
