@@ -12,7 +12,7 @@ mod loragw_sx1302;
 mod agc_firmware;
 mod loragw_usb_com;
 pub mod loragw_com;
-mod sx1261;
+pub mod sx1261;
 
 use std::sync::{Arc, RwLock};
 
@@ -533,13 +533,38 @@ impl Default for LgwConfLbt {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LgwConfSpecScan {
+    pub enable: bool,
+    pub freq_start: u32,
+    pub nb_chan: u8,
+    pub nb_scan: u16,
+    pub pace_s: u8,
+    pub bw: u32
+}
+
+impl Default for LgwConfSpecScan {
+    fn default() -> Self {
+        Self { 
+            enable: false,
+            freq_start: 922000000,
+            nb_chan: 8,
+            nb_scan: 2000,
+            pace_s: 10, 
+            bw: 50000
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LgwConfSx1261 {
     #[serde(default)]
     pub enable:  bool,           //* enable or disable SX1261 radio */
     pub spi_path: Option<String>,       //* Path to access the SPI device to connect to the SX1261 (not used for USB com type) */
     pub rssi_offset: f32,        //* value to be applied to the sx1261 RSSI value (dBm) */
     #[serde(default)]
-    pub lbt_conf:LgwConfLbt           //* listen-before-talk configuration */
+    pub lbt_conf:LgwConfLbt  ,  
+    #[serde(default)]       //* listen-before-talk configuration */
+    pub spectral_scan: LgwConfSpecScan
 }
 
 impl Default for LgwConfSx1261 {
@@ -547,8 +572,9 @@ impl Default for LgwConfSx1261 {
         Self { 
             enable: false, 
             spi_path: None, 
-            rssi_offset: 0.0f32, 
-            lbt_conf: Default::default() 
+            rssi_offset: 18.0f32, 
+            lbt_conf: Default::default(),
+            spectral_scan: Default::default()
         }
     }
 }

@@ -3,7 +3,7 @@ use std::{sync::{Arc, RwLock}, thread::sleep, time::Duration};
 use crate::hal::{ error::Error, mcu::{command::{ECmdSpiTarget, EComWriteMode, MCU_SPI_REQ_TYPE_READ_WRITE}, Mcu}, sx1261::{sx1261_def::{sx1261_freq_to_reg, SX1261StatusCommandStatus, SX1261StatusMode}, sx1261_pram::{PRAM, PRAM_COUNT}}, BW_125KHZ, BW_250KHZ};
 use super::{sx1261_def::{SX1261OpCode, SX1261StandbyModes}, LgwSpectralScanStatus};
 use anyhow::{Result,anyhow};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, trace};
 
 #[derive(Debug)]
 pub struct SX126x {
@@ -55,7 +55,7 @@ impl SX126x {
         Ok(())
     }
 
-    pub fn read(&mut self, op_code: SX1261OpCode, data: &[u8], size: usize ) -> Result<()> {
+    pub fn read(&mut self, op_code: SX1261OpCode, data: &mut [u8], size: usize ) -> Result<()> {
         let command_size = size + 6;
         let mut in_out_buf = vec![0u8; command_size];
 
@@ -78,6 +78,10 @@ impl SX126x {
         else {
             let mut mcu = self.mcu.write().unwrap();
             mcu.mcu_spi_write(&mut in_out_buf)?;
+        }
+
+        for i in 0..size {
+            data[i] = in_out_buf[6+i]
         }
 
         Ok(())
@@ -133,9 +137,8 @@ impl SX126x {
 
 
     fn check_status( &mut self, expected_status: u8) -> Result<()> {
+        let status   = self.get_status()?;
 
-
-        let status   = self.get_status() ?;
         if status != expected_status {
             error!("ERROR: SX1261 status is not as expected: got:0x{:02X} expected:0x{:02X}\n", status, expected_status);
             return Err(Error::LGW_HAL_ERROR.into())
@@ -293,7 +296,9 @@ impl SX126x {
         buff[0] = SX1261StandbyModes::SX1261_STDBY_RC as u8;
         self.reg_w(SX1261OpCode::SX1261_SET_STANDBY, &buff, 1)?;
 
-    
+        
+        sleep(Duration::from_millis(10));
+
         /* Check radio status */
         self.check_status(SX1261StatusMode::SX1261_STATUS_MODE_STBY_RC as u8 | SX1261StatusCommandStatus::SX1261_STATUS_READY as u8)?;
     
@@ -323,10 +328,12 @@ impl SX126x {
         buff[1] = ((nb_scan >> 0) & 0xFF) as u8; /* nb_scan LSB */
         buff[2] = 11; /* interval between scans - 8.2 us */
 
-        self.reg_w(SX1261OpCode::SX1261_0X9B, &buff, 9)?;
+        if let Err(e) = self.reg_w(SX1261OpCode::SX1261_0X9B, &buff, 4) {
+            error!(Error=%e, "Unable to start spectral scan");
+            return Err(Error::LGW_REG_ERROR.into());
+        }
 
-
-        info!("INFO: Spectral Scan started...\n");
+        trace!("INFO: Spectral Scan started...\n");
 
         Ok(())
     }
@@ -393,14 +400,14 @@ impl SX126x {
 
     pub fn spectral_scan_abort(&mut self) -> Result<()>{
 
-        let mut buff = [0u8;16];
+        let mut buff = [0u8;3];
         /* Disable LBT */
         buff[0] = 0x08;
         buff[1] = 0x9B;
         buff[2] = 0x00;
         self.reg_w(SX1261OpCode::SX1261_WRITE_REGISTER, &buff, 3)?;
 
-        debug!("SX1261: spectral scan aborted\n");
+        trace!("SX1261: spectral scan aborted\n");
 
         Ok(())
     }
@@ -489,9 +496,11 @@ impl SX126x {
         self.set_write_mode(EComWriteMode::LGW_COM_WRITE_MODE_SINGLE);
 
     
-        debug!("SX1261: RX params set to {:} Hz (bw:0x%{:02X})\n", freq_hz, bandwidth);
+        trace!("SX1261: RX params set to {:} Hz (bw:0x%{:02X})\n", freq_hz, bandwidth);
     
         Ok(())
     }
     
 }
+
+

@@ -9,6 +9,7 @@ mod sx1261_pram;
 */
 
 #[allow(non_camel_case_types)]
+#[derive(PartialEq,Clone, Copy)]
 pub enum LgwSpectralScanStatus {
   LGW_SPECTRAL_SCAN_STATUS_NONE,
   LGW_SPECTRAL_SCAN_STATUS_ON_GOING,
